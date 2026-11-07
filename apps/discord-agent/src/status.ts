@@ -24,6 +24,8 @@ export const COMMAND_HELP = [
   "!status — show this thread's queue, worker, work-session and maintenance state.",
   "!queue — list this thread's queued/running task IDs in accepted order and explain why each task is waiting; no model call.",
   "!work 30m <goal> or !work 2h <goal> — run checkpointed steps with 1–120 minutes of active execution, at most 32 completed steps. Other threads get turns between steps.",
+  "!goal [30m|2h] <goal> / !loop [30m|2h] <goal> — continue under a fresh Codex supervisor; default 30 minutes shared execution, at most 32 reviewed steps.",
+  "!goal status|pause|resume|stop [task ID] — inspect or control this thread's supervised goal. Pause/stop wait for a successful phase boundary; resume keeps the remaining budget.",
   "!result [task ID] — read the saved response (latest task by default).",
   "!cancel <task ID> — cancel a queued task or stop this thread's active process.",
   "!recover [task ID] [instruction] — inspect prior actions and continue a failed or interrupted task; the current thread's blocking task is selected when the ID is omitted. Replaces queued follow-ups in this thread.",
@@ -80,6 +82,7 @@ export function threadStatus(
   const workflow = currentWorkflow
     ? store.workflow(currentWorkflow.job_id)
     : undefined;
+  const goal = workflow ? store.goal(workflow.job_id) : undefined;
   const effect = store.effect(threadId);
   const maintenance =
     !effect ||
@@ -119,11 +122,23 @@ export function threadStatus(
       ? [
           `Work session ${workflow.job_id}: ${workflow.state}; ${workflow.step_count}/${workflow.max_steps} completed steps; ${Math.max(0, Math.ceil((workflow.budget_ms - workflow.elapsed_ms) / 1000))} seconds of active budget remain.`,
           ...(workflow.last_summary
-            ? [`Last verified checkpoint: ${workflow.last_summary}`]
+            ? [
+                `Last ${goal ? "accepted supervisor review" : "verified checkpoint"}: ${workflow.last_summary}`,
+              ]
+            : []),
+          ...(goal
+            ? [
+                `Supervisor: ${goal.pending_output ? "worker candidate saved; review pending" : "waiting for the next worker result"}; control ${goal.control}; ${goal.stalled_count}/3 consecutive stalled reviews.`,
+                ...(workflow.next_action
+                  ? [`Follow-up: ${workflow.next_action}`]
+                  : []),
+              ]
             : []),
           ...(workflow.state === "paused"
             ? [
-                "The work-session goal is not marked complete. A fresh explicit !work budget can continue this thread's saved session.",
+                goal
+                  ? "The supervised goal is not marked complete. Use !goal resume if budget remains and this thread is idle; otherwise authorize a fresh !goal budget."
+                  : "The work-session goal is not marked complete. A fresh explicit !work budget can continue this thread's saved session.",
               ]
             : []),
         ]

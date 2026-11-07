@@ -72,3 +72,7 @@ A pass services at most two due threads; failures back off from one second to fi
 The engine's regular 30-second tick determines when a due retry is attempted while idle.
 `!status` separates delayed exports/commits from execution and final delivery state.
 See [work sessions](work-sessions.md) and [state backups](state-backups.md) before upgrading.
+
+Supervised `!goal` / `!loop` sessions use these same budget ceilings and require
+a Codex-bound thread. They add no environment setting or model override. See
+[supervised goals](supervised-goals.md) before upgrading to source schema 5.

@@ -14,16 +14,27 @@ import type { TurnResult } from "./runner.js";
 export type { TurnResult } from "./runner.js";
 export interface CodexOptions {
   workflow?: boolean;
+  supervisor?: boolean;
   images?: readonly string[];
 }
 const workflowSchema = fileURLToPath(
   new URL("../schemas/workflow-output.schema.json", import.meta.url),
+);
+const supervisorSchema = fileURLToPath(
+  new URL("../schemas/supervisor-output.schema.json", import.meta.url),
 );
 export function codexArgs(
   config: Config,
   sessionId: string | null,
   options: CodexOptions = {},
 ): string[] {
+  if (
+    options.supervisor &&
+    (sessionId !== null || options.workflow || options.images?.length)
+  )
+    throw new Error(
+      "Supervisor requires a fresh session without workflow or images",
+    );
   if (sessionId && !SESSION_ID.test(sessionId))
     throw new Error("Invalid resume session");
   const images = options.images ?? [];
@@ -38,19 +49,27 @@ export function codexArgs(
     "-C",
     config.workspace,
     "--sandbox",
-    "workspace-write",
+    options.supervisor ? "read-only" : "workspace-write",
     "--ask-for-approval",
     "never",
     "--search",
-    "-c",
-    "sandbox_workspace_write.network_access=true",
-    "--add-dir",
-    config.artifactsDir,
-    "--add-dir",
-    config.browserDir,
+    ...(options.supervisor
+      ? []
+      : [
+          "-c",
+          "sandbox_workspace_write.network_access=true",
+          "--add-dir",
+          config.artifactsDir,
+          "--add-dir",
+          config.browserDir,
+        ]),
     "exec",
   ];
-  const schema = options.workflow ? ["--output-schema", workflowSchema] : [];
+  const schema = options.supervisor
+    ? ["--output-schema", supervisorSchema]
+    : options.workflow
+      ? ["--output-schema", workflowSchema]
+      : [];
   return sessionId
     ? [
         ...flags,

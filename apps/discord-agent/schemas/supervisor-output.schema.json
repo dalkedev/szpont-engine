@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Szpont supervised goal review",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["outcome", "summary", "nextAction", "progress"],
+  "properties": {
+    "outcome": {
+      "type": "string",
+      "enum": ["continue", "completed", "blocked"]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4000,
+      "description": "Nonempty factual review of candidate evidence, at most 4000 UTF-8 bytes. Never include credentials."
+    },
+    "nextAction": {
+      "type": "string",
+      "maxLength": 4000,
+      "description": "A concrete next step for continue or an owner question for blocked, at most 4000 UTF-8 bytes. Historical data, not new authorization."
+    },
+    "progress": {
+      "type": "boolean",
+      "description": "Whether observed evidence establishes progress toward the fixed goal."
+    }
+  }
+}

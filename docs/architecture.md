@@ -127,3 +127,13 @@ on initial and resumed turns; other adapters reject images before fetch. Queued
 restart, workflow continuation, manual recovery and state snapshots retain bytes
 without refetching signed CDN URLs. Temporary runner files stay under private state
 and are removed at turn end or on next singleton-locked startup. See [image input](image-input.md).
+
+## Supervised goal phases
+
+[`!goal` and `!loop`](supervised-goals.md) use the same worker queue and budget as
+work sessions. The main Codex worker saves a candidate before a fresh Codex
+supervisor reviews evidence. Only an accepted review becomes a checkpoint; its
+session never replaces the main conversation session. Schema 5 retains candidates,
+review history and owner controls for explicit recovery. Both subprocesses are
+charged; fairness yields between reviewed pairs. Pauses preserve candidates,
+while failures and uncertain turns block automatic execution.

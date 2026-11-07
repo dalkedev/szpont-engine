@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
+import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -56,7 +57,7 @@ test("fresh database receives current version and durable workflow/effect tables
   const path = pathFor(t),
     store = new Store(path);
   t.after(() => store.close());
-  assert.equal(SCHEMA_VERSION, 4);
+  assert.equal(SCHEMA_VERSION, 5);
   assert.equal(
     store.db.prepare("PRAGMA user_version").get().user_version,
     SCHEMA_VERSION,
@@ -191,5 +192,102 @@ test("reopening current schema does not dirty already synchronized effects", (t)
   assert.equal(
     store.db.prepare("PRAGMA user_version").get().user_version,
     SCHEMA_VERSION,
+  );
+});
+
+test("schema 4 migration preserves existing work without treating it as supervised", (t) => {
+  const path = pathFor(t);
+  let store = new Store(path);
+  store.enqueueWorkflow(id(1), thread, "Ordinary workflow", 60000);
+  const before = store.get(id(1));
+  store.db.exec(
+    "DROP TABLE goal_reviews; DROP TABLE goals; PRAGMA user_version=4",
+  );
+  store.close();
+  store = new Store(path);
+  t.after(() => store.close());
+  assert.deepEqual(store.get(id(1)), before);
+  assert.equal(store.goal(id(1)), undefined);
+  assert.equal(
+    store.enqueueGoal(id(2), thread, "New supervised goal", 60000),
+    true,
+  );
+  assert.deepEqual(store.db.prepare("PRAGMA foreign_key_check").all(), []);
+});
+
+test("schema 5 rejects missing or malformed goal storage before changing journal mode", (t) => {
+  for (const malformed of [false, true]) {
+    const path = pathFor(t);
+    const store = new Store(path);
+    store.db.exec(
+      "DROP TABLE goal_reviews; DROP TABLE goals; PRAGMA journal_mode=DELETE",
+    );
+    if (malformed)
+      store.db.exec(
+        "CREATE TABLE goals(job_id TEXT); CREATE TABLE goal_reviews(job_id TEXT)",
+      );
+    store.close();
+    const bytes = readFileSync(path);
+    assert.throws(() => new Store(path), /supervised goal storage is missing/);
+    assert.deepEqual(readFileSync(path), bytes);
+  }
+});
+
+test("failed goal migration rolls back goal tables and schema version", (t) => {
+  const path = pathFor(t);
+  const store = new Store(path);
+  store.db.exec(
+    "DROP TABLE goal_reviews; DROP TABLE goals; PRAGMA user_version=4; CREATE TABLE goal_reviews(collision TEXT)",
+  );
+  store.close();
+  assert.throws(() => new Store(path), /already exists/);
+  const db = new DatabaseSync(path);
+  t.after(() => db.close());
+  assert.equal(db.prepare("PRAGMA user_version").get().user_version, 4);
+  assert.equal(
+    db.prepare("SELECT 1 FROM sqlite_master WHERE name='goals'").get(),
+    undefined,
+  );
+});
+
+test("two processes waiting for the schema 4 migration both open the upgraded database", async (t) => {
+  const path = pathFor(t);
+  const store = new Store(path);
+  store.enqueue(id(1), thread, "Retain concurrent migration work");
+  store.db.exec(
+    "DROP TABLE goal_reviews; DROP TABLE goals; PRAGMA user_version=4; BEGIN IMMEDIATE",
+  );
+  const module = new URL("../dist/store.js", import.meta.url).href;
+  const run = () =>
+    new Promise((resolve, reject) => {
+      const child = spawn(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import { Store } from ${JSON.stringify(module)}; const s=new Store(${JSON.stringify(path)}); if(s.get(${JSON.stringify(id(1))}).status!=="queued") process.exitCode=2; s.close();`,
+        ],
+        { stdio: ["ignore", "ignore", "pipe"] },
+      );
+      let error = "";
+      child.stderr.on("data", (chunk) => (error += chunk));
+      child.on("error", reject);
+      child.on("close", (code) =>
+        code === 0
+          ? resolve()
+          : reject(new Error(error || `Child exit ${code}`)),
+      );
+    });
+  const opening = [run(), run()];
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  store.db.exec("COMMIT");
+  store.close();
+  await Promise.all(opening);
+  const reopened = new Store(path);
+  t.after(() => reopened.close());
+  assert.equal(reopened.goal(id(1)), undefined);
+  assert.equal(
+    reopened.db.prepare("PRAGMA user_version").get().user_version,
+    5,
   );
 });

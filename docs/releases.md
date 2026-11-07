@@ -72,3 +72,11 @@ Before upgrading, create and verify a pre-upgrade snapshot using the [state back
 Versions 0.5.0 through 0.6.1 share schema 4, but a rollback still requires reviewing recovery jobs and external actions accepted by the newer engine. Retain a coordinated pre-upgrade snapshot, workspace checkpoint and image digest rather than treating schema compatibility as an automatic replay guarantee.
 
 The 0.2 engine predates the version guard and cannot preserve later workflow or provider semantics. It must never open migrated state. A rollback restores earlier database contents; it does not undo files, posts, deployments or other external effects. Public and private-deployment databases are not interchangeable.
+
+## Unreleased source: supervised goals
+
+The goal-loop change migrates public schemas 0–4 to schema 5 and adds
+[`!goal` / `!loop`](supervised-goals.md). Versioned 0.6.1 statements above remain
+historical. Retain a pre-upgrade schema-4 snapshot for rollback to 0.6.1; a
+0.6.1 binary cannot open schema 5. No release or image is implied by this source
+change.

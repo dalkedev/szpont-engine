@@ -1,5 +1,8 @@
 # Bounded work sessions
 
+For an independent supervisor that reviews each worker step, use
+[`!goal` / `!loop`](supervised-goals.md). The `!work` interface below stays unchanged.
+
 A normal Discord message requests one runner turn. Use an explicit owner command when a goal
 needs several verified steps:
 

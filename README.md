@@ -125,6 +125,10 @@ Execution, notification delivery and external effects are separate facts.
 A successful local turn does not prove a deployment, post or website action succeeded.
 [Architecture](docs/architecture.md) covers the state transitions and recovery contract.
 
+To continue a larger task under independent review, use `!goal 30m <goal>` or
+`!loop 2h <goal>` in a Codex thread. [Supervised goals](docs/supervised-goals.md)
+cover follow-up questions, pause/resume/stop and shared execution budgets.
+
 ## Quick start
 
 You need Linux, **Node.js 24.x**, Git, `flock`, your own Discord bot and an authenticated runner.

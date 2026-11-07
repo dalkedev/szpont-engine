@@ -24,6 +24,12 @@ import { Store, type Job } from "./store.js";
 import { COMMAND_HELP, providerLabel, threadStatus } from "./status.js";
 import { threadQueue } from "./queue.js";
 import {
+  parseGoalCommand,
+  goalWorkerPrompt,
+  goalReviewPrompt,
+  validateGoalReview,
+} from "./goals.js";
+import {
   parseWorkCommand,
   parseRecoveryCommand,
   validateWorkOutcome,
@@ -166,6 +172,75 @@ export class Engine {
             this.config.parentId,
           )
         : [];
+    if (/^!(?:goal|loop)(?:\s|$)/.test(text)) {
+      if (!this.store.controlOnce(message.id)) return true;
+      let changed = false;
+      try {
+        const request = parseGoalCommand(text)!;
+        if (request.kind === "start") {
+          if (this.providerFor(thread) !== "codex") {
+            await this.notice(
+              thread,
+              "Supervised goals currently require a Codex-bound thread. Nothing was queued; this thread's runner was not changed.",
+            );
+            return true;
+          }
+          const goal = redact(request.goal, this.config.token);
+          const blocker = this.store.blockingJob(thread);
+          changed = blocker
+            ? this.store.recover(blocker.id, thread, message.id, {
+                work: { goal, budgetMs: request.budgetMs, supervised: true },
+              })
+            : this.store.enqueueGoal(
+                message.id,
+                thread,
+                goal,
+                request.budgetMs,
+                this.config.provider ?? "codex",
+              );
+          await this.notice(
+            thread,
+            `Supervised goal queued: ${message.id}. Worker and fresh supervisor share ${Math.round(request.budgetMs / 60000)} minutes and at most 32 reviewed steps. Use !goal status, pause, resume or stop. Existing authorization applies throughout.`,
+          );
+        } else {
+          const goal = request.id
+            ? this.store.goal(request.id)
+            : this.store.latestGoal(thread);
+          const job = goal ? this.store.get(goal.job_id) : undefined;
+          if (!goal || !job || job.thread_id !== thread) {
+            await this.notice(
+              thread,
+              "No supervised goal found in this thread. Nothing changed.",
+            );
+            return true;
+          }
+          if (request.kind === "status") {
+            await this.notice(thread, this.goalStatus(job.id));
+          } else {
+            changed =
+              request.kind === "resume"
+                ? this.store.resumeGoal(job.id, thread)
+                : this.store.requestGoalControl(job.id, thread, request.kind);
+            await this.notice(
+              thread,
+              changed
+                ? request.kind === "resume"
+                  ? `Goal ${job.id} resumed with its remaining budget.`
+                  : `Goal ${job.id}: ${request.kind} saved. A running process will finish its current bounded phase first; !cancel ${job.id} interrupts immediately and requires reconciliation.`
+                : "This goal cannot take that control in its current state. Use !goal status; exhausted budgets need a fresh explicit !goal budget, and uncertain turns need reconciliation.",
+            );
+          }
+        }
+      } catch {
+        await this.notice(
+          thread,
+          "Cannot apply this goal command. Use !goal [30m|2h] <goal>, !goal status|pause|resume|stop [task ID], or !loop with the same syntax. Resume needs a safely paused goal, remaining budget and an otherwise idle thread. Nothing new was queued.",
+        );
+      } finally {
+        if (changed) void this.kick();
+      }
+      return true;
+    }
     if (/^!recover(?:\s|$)/.test(text)) {
       if (!this.store.controlOnce(message.id)) return true;
       let changed = false;
@@ -516,67 +591,82 @@ export class Engine {
               savedImages,
             );
           }
-          started = this.monotonicNow();
-          const result = await this.deps.run(
-            workflow
-              ? {
-                  ...runnerConfig,
-                  timeoutMs: Math.max(
-                    1,
-                    Math.min(this.config.timeoutMs, remaining),
-                  ),
-                }
-              : runnerConfig,
-            prompt,
-            this.store.session(job.thread_id),
-            (id) => this.store.setSession(job!.thread_id, id, job!.provider),
-            this.abort.signal,
-            {
-              ...(workflow ? { workflow: true } : {}),
-              ...(imageFiles ? { images: imageFiles.paths } : {}),
-            },
-          );
-          spent = this.executionSpent(started);
-          started = undefined;
-          if (result.ok && workflow) {
-            let outcome;
-            try {
-              outcome = validateWorkOutcome(
-                redact(result.output, this.config.token),
-              );
-            } catch {
+          if (this.store.goal(job.id)) {
+            await this.runGoal(
+              job,
+              runnerConfig,
+              prompt,
+              this.abort.signal,
+              imageFiles?.paths,
+            );
+            committed = true;
+          } else {
+            started = this.monotonicNow();
+            const result = await this.deps.run(
+              workflow
+                ? {
+                    ...runnerConfig,
+                    timeoutMs: Math.max(
+                      1,
+                      Math.min(this.config.timeoutMs, remaining),
+                    ),
+                  }
+                : runnerConfig,
+              prompt,
+              this.store.session(job.thread_id),
+              (id) => this.store.setSession(job!.thread_id, id, job!.provider),
+              this.abort.signal,
+              {
+                ...(workflow ? { workflow: true } : {}),
+                ...(imageFiles ? { images: imageFiles.paths } : {}),
+              },
+            );
+            spent = this.executionSpent(started);
+            started = undefined;
+            if (result.ok && workflow) {
+              let outcome;
+              try {
+                outcome = validateWorkOutcome(
+                  redact(result.output, this.config.token),
+                );
+              } catch {
+                this.store.finish(
+                  job.id,
+                  "interrupted",
+                  "",
+                  "invalid_workflow_output",
+                  spent,
+                );
+                committed = true;
+              }
+              if (outcome) {
+                const checkpoint = this.store.checkpoint(
+                  job.id,
+                  outcome,
+                  spent,
+                );
+                committed = true;
+                if (checkpoint.continued)
+                  await this.notice(
+                    job.thread_id,
+                    `Work session ${job.id}: step ${workflow.step_count + 1} checkpoint saved. Continuing after other eligible threads.\n\n${outcome.summary}`,
+                  );
+              }
+            } else {
               this.store.finish(
                 job.id,
-                "interrupted",
-                "",
-                "invalid_workflow_output",
+                result.ok
+                  ? "succeeded"
+                  : result.error === "task_timeout" ||
+                      result.error === "owner_or_service_cancelled"
+                    ? "interrupted"
+                    : "failed",
+                redact(result.output, this.config.token),
+                result.error,
                 spent,
               );
               committed = true;
             }
-            if (outcome) {
-              const checkpoint = this.store.checkpoint(job.id, outcome, spent);
-              committed = true;
-              if (checkpoint.continued)
-                await this.notice(
-                  job.thread_id,
-                  `Work session ${job.id}: step ${workflow.step_count + 1} checkpoint saved. Continuing after other eligible threads.\n\n${outcome.summary}`,
-                );
-            }
-          } else {
-            this.store.finish(
-              job.id,
-              result.ok
-                ? "succeeded"
-                : result.error === "task_timeout" ||
-                    result.error === "owner_or_service_cancelled"
-                  ? "interrupted"
-                  : "failed",
-              redact(result.output, this.config.token),
-              result.error,
-              spent,
-            );
-            committed = true;
           }
         } catch {
           if (started !== undefined) spent = this.executionSpent(started);
@@ -611,6 +701,168 @@ export class Engine {
       complete();
     }
   }
+  private goalStatus(id: string): string {
+    const goal = this.store.goal(id)!,
+      workflow = this.store.workflow(id)!,
+      job = this.store.get(id)!;
+    return [
+      `Supervised goal ${id}: ${workflow.state}; task ${job.status}; control ${goal.control}.`,
+      `Phase: ${goal.pending_output ? "saved worker candidate awaiting supervisor review" : "main worker"}.`,
+      `Reviewed steps: ${workflow.step_count}/${workflow.max_steps}; remaining shared budget: ${Math.max(0, Math.ceil((workflow.budget_ms - workflow.elapsed_ms) / 1000))} seconds; stalled reviews: ${goal.stalled_count}/3.`,
+      ...(workflow.last_summary
+        ? [`Last accepted review: ${workflow.last_summary}`]
+        : []),
+      ...(workflow.next_action ? [`Follow-up: ${workflow.next_action}`] : []),
+      "Use !goal pause|resume|stop [task ID]. Pause/stop take effect at a successful phase boundary. !cancel interrupts immediately; stopping does not undo effects.",
+    ].join("\n");
+  }
+  private async runGoal(
+    job: Job,
+    runnerConfig: Config,
+    prompt: string,
+    signal: AbortSignal,
+    images?: readonly string[],
+  ): Promise<void> {
+    let started: number | undefined;
+    const finishFailure = (
+      output: string,
+      error: string,
+      elapsed: number,
+    ): void => {
+      this.store.finish(
+        job.id,
+        error === "task_timeout" || error === "owner_or_service_cancelled"
+          ? "interrupted"
+          : "failed",
+        redact(output, this.config.token),
+        error,
+        elapsed,
+      );
+    };
+    try {
+      let goal = this.store.goal(job.id)!;
+      let workflow = this.store.workflow(job.id)!;
+      if (this.store.applyGoalControl(job.id)) return;
+      if (!goal.pending_output) {
+        const remaining = workflow.budget_ms - workflow.elapsed_ms;
+        started = this.monotonicNow();
+        const worker = await this.deps.run(
+          {
+            ...runnerConfig,
+            timeoutMs: Math.max(1, Math.min(this.config.timeoutMs, remaining)),
+          },
+          goalWorkerPrompt(prompt),
+          this.store.session(job.thread_id),
+          (id) => this.store.setSession(job.thread_id, id, job.provider),
+          signal,
+          { workflow: true, ...(images?.length ? { images } : {}) },
+        );
+        const elapsed = this.executionSpent(started);
+        started = undefined;
+        if (!worker.ok || signal.aborted) {
+          finishFailure(
+            worker.output,
+            signal.aborted
+              ? "owner_or_service_cancelled"
+              : (worker.error ?? "goal_worker_failed"),
+            elapsed,
+          );
+          return;
+        }
+        let candidate;
+        try {
+          candidate = validateWorkOutcome(
+            redact(worker.output, this.config.token),
+          );
+        } catch {
+          this.store.finish(
+            job.id,
+            "interrupted",
+            "",
+            "invalid_workflow_output",
+            elapsed,
+          );
+          return;
+        }
+        this.store.saveGoalWorker(job.id, candidate, elapsed);
+      }
+      if (this.store.applyGoalControl(job.id)) return;
+      goal = this.store.goal(job.id)!;
+      workflow = this.store.workflow(job.id)!;
+      const remaining = workflow.budget_ms - workflow.elapsed_ms;
+      const candidate = validateWorkOutcome(goal.pending_output!);
+      await this.notice(
+        job.thread_id,
+        `Goal ${job.id}: worker candidate saved; independent supervisor is reviewing step ${workflow.step_count + 1}.`,
+      );
+      started = this.monotonicNow();
+      const review = await this.deps.run(
+        {
+          ...runnerConfig,
+          timeoutMs: Math.max(1, Math.min(this.config.timeoutMs, remaining)),
+        },
+        goalReviewPrompt({
+          goal: workflow.goal,
+          candidate,
+          lastSummary: workflow.last_summary,
+          nextAction: workflow.next_action,
+          step: workflow.step_count + 1,
+          remainingMs: Math.min(this.config.timeoutMs, remaining),
+          ...(job.recovery_of ? { recoveryContext: job.prompt } : {}),
+        }),
+        null,
+        () => {},
+        signal,
+        { supervisor: true },
+      );
+      const elapsed = this.executionSpent(started);
+      started = undefined;
+      if (!review.ok || signal.aborted) {
+        finishFailure(
+          review.output,
+          signal.aborted
+            ? "owner_or_service_cancelled"
+            : (review.error ?? "goal_supervisor_failed"),
+          elapsed,
+        );
+        return;
+      }
+      let outcome;
+      try {
+        outcome = validateGoalReview(redact(review.output, this.config.token));
+      } catch {
+        this.store.finish(
+          job.id,
+          "interrupted",
+          "",
+          "invalid_goal_review",
+          elapsed,
+        );
+        return;
+      }
+      const { progress, ...checkpoint } = outcome;
+      const result = this.store.reviewGoal(
+        job.id,
+        checkpoint,
+        progress,
+        elapsed,
+      );
+      if (result.continued)
+        await this.notice(
+          job.thread_id,
+          `Goal ${job.id}: supervisor accepted step ${workflow.step_count + 1}; continuing after other eligible threads.\n\n${outcome.summary}`,
+        );
+    } catch {
+      if (this.store.get(job.id)?.status === "running")
+        this.store.finish(
+          job.id,
+          "interrupted",
+          "",
+          "goal_phase_interrupted",
+          started === undefined ? 0 : this.executionSpent(started),
+        );
+    }
+  }
   private async notify(): Promise<void> {
     let job: Job | undefined;
     while ((job = this.store.pendingNotification())) {
@@ -623,13 +875,24 @@ export class Engine {
             workflow.step_count >= workflow.max_steps)
             ? "This uncertain turn exhausted its work budget or step cap. Use !status and !result to inspect it. Authorize a fresh !work 30m <goal> to reconcile state and continue the saved session. History and prior spent budget are retained."
             : `Use !recover ${job.id} to reconcile state and continue.`;
+        const supervised = this.store.goal(job.id);
         const text =
-          workflow?.state === "paused"
-            ? `Work session ${job.id}: paused after a verified checkpoint (${job.error_code ?? "budget exhausted"}). The overall goal is not marked complete. This thread is not blocked; a fresh explicit !work 30m <goal> budget can continue its saved session.\n\n${job.result ?? ""}`
-            : job.status === "succeeded"
-              ? job.result || "Completed without a text response."
-              : `Task ${job.id}: ${job.status} (${job.error_code ?? "unknown"}). Partial actions may have occurred. No automatic retry. ${recovery}\n\n${job.result ?? ""}`;
-        await this.send(job.thread_id, text);
+          supervised && job.status === "cancelled"
+            ? `Goal ${job.id}: stopped. Saved history and any worker candidate are retained; stopping does not undo actions already taken.`
+            : supervised && workflow?.state === "paused"
+              ? `Goal ${job.id}: paused (${job.error_code ?? "budget ceiling"}). The goal is not marked complete. Use !goal status; !goal resume keeps remaining budget, or an explicit new !goal budget authorizes further work.\n\n${job.result ?? ""}`
+              : workflow?.state === "paused"
+                ? `Work session ${job.id}: paused after a verified checkpoint (${job.error_code ?? "budget exhausted"}). The overall goal is not marked complete. This thread is not blocked; a fresh explicit !work 30m <goal> budget can continue its saved session.\n\n${job.result ?? ""}`
+                : job.status === "succeeded"
+                  ? job.result || "Completed without a text response."
+                  : `Task ${job.id}: ${job.status} (${job.error_code ?? "unknown"}). Partial actions may have occurred. No automatic retry. ${recovery}\n\n${job.result ?? ""}`;
+        const goal = this.store.goal(job.id);
+        await this.send(
+          job.thread_id,
+          goal && workflow?.next_action
+            ? `${text}\n\nFollow-up: ${workflow.next_action}`
+            : text,
+        );
         this.store.notification(job.id, "sent");
       } catch {
         this.store.notification(job.id, "ambiguous");

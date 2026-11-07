@@ -5,9 +5,9 @@ committed WAL pages. It opens the source read-only, verifies database integrity 
 foreign keys, and publishes a complete standalone database at a **new** path. No bot
 token, engine configuration, Discord connection or model call is needed.
 
-The tool supports legacy schemas 0, 1, 2 and 3, and current public schema 4. It does not migrate them, and
+The tool supports legacy schemas 0–4 and current source schema 5. It does not migrate them, and
 refuses a newer schema. Both `backup` and `restore` preserve jobs, sessions, workflow
-checkpoints, notification receipts, pending transcript/memory effects and private image bytes.
+checkpoints, notification receipts, pending transcript/memory effects private image bytes, saved goal candidates and supervisor reviews.
 
 ## Create a snapshot
 

@@ -15,7 +15,7 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // This tool deliberately does not import the engine, its configuration or any secrets.
-export const MAX_SCHEMA_VERSION = 4;
+export const MAX_SCHEMA_VERSION = 5;
 const publicRoot = await realpath(fileURLToPath(new URL("../", import.meta.url)));
 const usage =
   "Usage: node scripts/state-snapshot.mjs backup|restore --source /private/input.sqlite --destination /private/new.sqlite";

@@ -11,6 +11,7 @@ export interface TurnResult {
 }
 export interface RunnerOptions {
   workflow?: boolean;
+  supervisor?: boolean;
   images?: readonly string[];
 }
 
@@ -37,6 +38,13 @@ export function runTurn(
   signal?: AbortSignal,
   options: RunnerOptions = {},
 ): Promise<TurnResult> {
+  if (options.supervisor && (config.provider ?? "codex") !== "codex")
+    return Promise.resolve({
+      ok: false,
+      output: "",
+      error: "unsupported_supervisor_provider",
+      sessionId,
+    });
   if (options.images?.length && !supportsImages(config.provider))
     return Promise.resolve({
       ok: false,

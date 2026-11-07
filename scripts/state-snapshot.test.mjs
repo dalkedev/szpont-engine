@@ -477,7 +477,7 @@ test("schema 4 backup and restore preserve image bytes across interrupted-job re
     store.finish(job, "interrupted", "", "synthetic_interruption");
     store.recover(job, thread, recovered);
     const report = await snapshotState({ operation: "backup", ...f });
-    assert.equal(report.schemaVersion, 4);
+    assert.equal(report.schemaVersion, SCHEMA_VERSION);
     const restored = join(f.directory, "restored-images.sqlite");
     await snapshotState({
       operation: "restore",
@@ -506,4 +506,30 @@ test("schema 4 backup and restore preserve image bytes across interrupted-job re
     store.close();
   }
   await noStaging(f.directory);
+});
+
+test("schema 5 backup and restore retain a supervised candidate and control request", async (t) => {
+  const f = await fixture(t);
+  const store = new Store(f.source);
+  const candidate = {
+    outcome: "continue",
+    summary: "Synthetic saved candidate",
+    nextAction: "Review the evidence",
+  };
+  store.enqueueGoal(job, thread, "Synthetic supervised goal", 60000);
+  store.claim();
+  store.saveGoalWorker(job, candidate, 1000);
+  store.requestGoalControl(job, thread, "pause");
+  store.close();
+  const report = await snapshotState({ operation: "backup", ...f });
+  assert.equal(report.schemaVersion, 5);
+  const reopened = new Store(f.destination);
+  try {
+    assert.equal(reopened.goal(job).pending_output, JSON.stringify(candidate));
+    assert.equal(reopened.goal(job).control, "pause");
+    assert.equal(reopened.workflow(job).elapsed_ms, 1000);
+    assert.equal(reopened.get(job).status, "running");
+  } finally {
+    reopened.close();
+  }
 });

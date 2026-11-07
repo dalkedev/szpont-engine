@@ -90,7 +90,7 @@ for (const version of [1, 2])
     f.store.enqueueWorkflow(id(1), thread(1), "Synthetic legacy goal", 60_000);
     f.store.setSession(thread(1), uuid);
     f.store.db.exec(`
-      DROP TABLE job_images;
+      DROP TABLE goal_reviews; DROP TABLE goals; DROP TABLE job_images;
     DROP TRIGGER preserve_conversation_provider;
       DROP TRIGGER preserve_job_provider;
       ALTER TABLE conversations DROP COLUMN provider;
@@ -311,7 +311,7 @@ test("provider migration rolls back both added bindings and schema version on DD
   const f = await fixture(t);
   f.store.enqueue(id(1), thread(1), "Preserved legacy task");
   f.store.db.exec(`
-    DROP TABLE job_images;
+    DROP TABLE goal_reviews; DROP TABLE goals; DROP TABLE job_images;
     DROP TRIGGER preserve_conversation_provider;
     DROP TRIGGER preserve_job_provider;
     ALTER TABLE conversations DROP COLUMN provider;

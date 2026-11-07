@@ -9,7 +9,7 @@ import {
 import { validateSavedImages, type SavedImage } from "./images.js";
 import type { WorkOutcome } from "./workflow.js";
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 export type JobStatus =
   | "queued"
   | "running"
@@ -43,6 +43,23 @@ export interface Workflow {
   next_action: string | null;
   state: "active" | "completed" | "paused" | "blocked" | "cancelled";
 }
+export interface Goal {
+  job_id: string;
+  pending_output: string | null;
+  control: "active" | "pause" | "stop";
+  stalled_count: number;
+  last_review: string | null;
+  last_candidate: string | null;
+}
+export interface GoalReview {
+  job_id: string;
+  step: number;
+  candidate: string;
+  review: string;
+  progress: boolean;
+  elapsed_ms: number;
+  created_at: number;
+}
 export interface WorkflowStep {
   job_id: string;
   step: number;
@@ -69,7 +86,7 @@ export type EffectError =
 export interface RecoveryOptions {
   note?: string;
   /** A fresh, explicitly authorized work budget; prior execution stays charged. */
-  work?: { goal: string; budgetMs: number };
+  work?: { goal: string; budgetMs: number; supervised?: boolean };
   images?: readonly SavedImage[];
 }
 
@@ -161,11 +178,14 @@ export class Store {
           .get()
       )
         throw new Error("Invalid database schema: image storage is missing");
+      if (version >= 5) this.validateGoals();
       this.db.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000");
       if (version === 0) this.migrate();
       if (version < 2) this.migrateAcceptance();
       if (version < 3) this.migrateProviders();
       if (version < 4) this.migrateImages();
+      if (version < 5) this.migrateGoals();
+      this.validateGoals();
       this.db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL");
     } catch (error) {
       this.db.close();
@@ -285,7 +305,7 @@ export class Store {
       const version = (
         this.db.prepare("PRAGMA user_version").get() as { user_version: number }
       ).user_version;
-      if (version === SCHEMA_VERSION) return;
+      if (version >= 4 && version <= SCHEMA_VERSION) return;
       if (version !== 3)
         throw new Error(`Unsupported database schema version ${version}`);
       this.db.exec(`
@@ -297,6 +317,68 @@ export class Store {
           data BLOB NOT NULL CHECK(length(data) BETWEEN 1 AND 8388608),
           PRIMARY KEY(job_id,ordinal));
         PRAGMA user_version=4;
+      `);
+    });
+  }
+  private validateGoals(): void {
+    for (const [table, columns] of [
+      [
+        "goals",
+        [
+          "job_id",
+          "pending_output",
+          "control",
+          "stalled_count",
+          "last_review",
+          "last_candidate",
+        ],
+      ],
+      [
+        "goal_reviews",
+        [
+          "job_id",
+          "step",
+          "candidate",
+          "review",
+          "progress",
+          "elapsed_ms",
+          "created_at",
+        ],
+      ],
+    ] as const) {
+      const actual = this.db.prepare(`PRAGMA table_info(${table})`).all() as {
+        name: string;
+      }[];
+      if (
+        !columns.every((name) => actual.some((column) => column.name === name))
+      )
+        throw new Error(
+          "Invalid database schema: supervised goal storage is missing",
+        );
+    }
+  }
+  private migrateGoals(): void {
+    this.transaction(() => {
+      const version = (
+        this.db.prepare("PRAGMA user_version").get() as { user_version: number }
+      ).user_version;
+      if (version === 5) {
+        this.validateGoals();
+        return;
+      }
+      if (version !== 4)
+        throw new Error(`Unsupported database schema version ${version}`);
+      this.db.exec(`
+        CREATE TABLE goals(
+          job_id TEXT PRIMARY KEY REFERENCES workflows(job_id),pending_output TEXT,
+          control TEXT NOT NULL DEFAULT 'active' CHECK(control IN('active','pause','stop')),
+          stalled_count INTEGER NOT NULL DEFAULT 0 CHECK(stalled_count>=0),last_review TEXT,last_candidate TEXT);
+        CREATE TABLE goal_reviews(
+          job_id TEXT NOT NULL REFERENCES goals(job_id),step INTEGER NOT NULL CHECK(step>=1),
+          candidate TEXT NOT NULL,review TEXT NOT NULL,progress INTEGER NOT NULL CHECK(progress IN(0,1)),
+          elapsed_ms INTEGER NOT NULL CHECK(elapsed_ms>=1),created_at INTEGER NOT NULL,
+          PRIMARY KEY(job_id,step));
+        PRAGMA user_version=5;
       `);
     });
   }
@@ -420,6 +502,256 @@ export class Store {
           "INSERT INTO workflows(job_id,goal,budget_ms,max_steps,state) VALUES(?,?,?,?,'active')",
         )
         .run(id, goal, budgetMs, maxSteps);
+      this.dirty(threadId);
+      return true;
+    });
+  }
+  enqueueGoal(
+    id: string,
+    threadId: string,
+    goal: string,
+    budgetMs: number,
+    defaultProvider: ProviderId = "codex",
+  ): boolean {
+    this.validateIdentity(id, threadId);
+    if (
+      !goal.trim() ||
+      goal.length > MAX_MESSAGE ||
+      !Number.isSafeInteger(budgetMs) ||
+      budgetMs < 60_000 ||
+      budgetMs > 7_200_000
+    )
+      throw new Error("Invalid work budget or goal");
+    return this.transaction(() => {
+      if (this.get(id)) return false;
+      if ((this.provider(threadId) ?? defaultProvider) !== "codex")
+        throw new Error("Supervised goals require a Codex-bound thread");
+      this.insertQueuedJob(id, threadId, goal, null, defaultProvider);
+      this.db
+        .prepare(
+          "INSERT INTO workflows(job_id,goal,budget_ms,max_steps,state) VALUES(?,?,?,32,'active')",
+        )
+        .run(id, goal, budgetMs);
+      this.db.prepare("INSERT INTO goals(job_id) VALUES(?)").run(id);
+      this.dirty(threadId);
+      return true;
+    });
+  }
+  goal(id: string): Goal | undefined {
+    return this.db.prepare("SELECT * FROM goals WHERE job_id=?").get(id) as
+      | Goal
+      | undefined;
+  }
+  latestGoal(threadId: string): Goal | undefined {
+    return this.db
+      .prepare(
+        `SELECT g.* FROM goals g JOIN jobs j ON j.id=g.job_id
+      JOIN job_acceptance a ON a.job_id=j.id WHERE j.thread_id=? ORDER BY a.sequence DESC LIMIT 1`,
+      )
+      .get(threadId) as Goal | undefined;
+  }
+  goalReviews(id: string): GoalReview[] {
+    return (
+      this.db
+        .prepare("SELECT * FROM goal_reviews WHERE job_id=? ORDER BY step")
+        .all(id) as unknown as (Omit<GoalReview, "progress"> & {
+        progress: number;
+      })[]
+    ).map((row) => ({ ...row, progress: Boolean(row.progress) }));
+  }
+  saveGoalWorker(id: string, outcome: WorkOutcome, elapsedMs: number): void {
+    this.validateCheckpoint(outcome);
+    const spent = this.spent(elapsedMs);
+    this.transaction(() => {
+      const job = this.get(id),
+        workflow = this.workflow(id),
+        goal = this.goal(id);
+      if (
+        !job ||
+        job.status !== "running" ||
+        !workflow ||
+        workflow.state !== "active" ||
+        !goal
+      )
+        throw new Error("Goal ownership lost");
+      if (goal.pending_output !== null)
+        throw new Error("Goal candidate already saved");
+      const candidate = JSON.stringify({
+        outcome: outcome.outcome,
+        summary: outcome.summary,
+        nextAction: outcome.nextAction,
+      });
+      this.db
+        .prepare("UPDATE goals SET pending_output=? WHERE job_id=?")
+        .run(candidate, id);
+      this.db
+        .prepare("UPDATE workflows SET elapsed_ms=? WHERE job_id=?")
+        .run(this.totalSpent(workflow.elapsed_ms, spent), id);
+      this.dirty(job.thread_id);
+    });
+  }
+  reviewGoal(
+    id: string,
+    outcome: WorkOutcome,
+    progress: boolean,
+    elapsedMs: number,
+  ): { continued: boolean; status: JobStatus; reason: string | null } {
+    this.validateCheckpoint(outcome);
+    if (typeof progress !== "boolean") throw new Error("Invalid goal progress");
+    const spent = this.spent(elapsedMs);
+    return this.transaction(() => {
+      const goal = this.goal(id),
+        workflow = this.workflow(id);
+      if (!goal?.pending_output || !workflow)
+        throw new Error("Goal candidate is missing");
+      const verifiedProgress =
+        progress && goal.last_candidate !== goal.pending_output;
+      const stalled = verifiedProgress ? 0 : goal.stalled_count + 1;
+      const accepted: WorkOutcome =
+        stalled >= 3
+          ? {
+              outcome: "blocked",
+              summary:
+                "Three consecutive reviews found no progress. " +
+                outcome.summary.slice(0, 900),
+              nextAction: outcome.nextAction.trim()
+                ? outcome.nextAction
+                : "Which prerequisite or verified evidence should change before the next attempt? Reconcile the repeated candidate and saved receipts first.",
+            }
+          : outcome;
+      const review = JSON.stringify({ ...outcome, progress: verifiedProgress });
+      this.db
+        .prepare(
+          "INSERT INTO goal_reviews(job_id,step,candidate,review,progress,elapsed_ms,created_at) VALUES(?,?,?,?,?,?,?)",
+        )
+        .run(
+          id,
+          workflow.step_count + 1,
+          goal.pending_output,
+          review,
+          Number(verifiedProgress),
+          spent,
+          Date.now(),
+        );
+      this.db
+        .prepare(
+          "UPDATE goals SET pending_output=NULL,stalled_count=?,last_review=?,last_candidate=? WHERE job_id=?",
+        )
+        .run(stalled, review, goal.pending_output, id);
+      const result = this.acceptCheckpoint(id, accepted, spent);
+      if (result.continued && goal.control !== "active") {
+        this.goalControlBoundary(id);
+        const stopped = this.get(id)!;
+        return {
+          continued: false,
+          status: stopped.status,
+          reason: stopped.error_code,
+        };
+      }
+      return result;
+    });
+  }
+  requestGoalControl(
+    id: string,
+    threadId: string,
+    action: "pause" | "stop",
+  ): boolean {
+    if (!["pause", "stop"].includes(action))
+      throw new Error("Invalid goal control");
+    return this.transaction(() => {
+      const job = this.get(id),
+        workflow = this.workflow(id);
+      if (
+        !job ||
+        job.thread_id !== threadId ||
+        !this.goal(id) ||
+        !workflow ||
+        !(
+          ["queued", "running"].includes(job.status) ||
+          (action === "stop" && workflow.state === "paused")
+        )
+      )
+        return false;
+      this.db
+        .prepare("UPDATE goals SET control=? WHERE job_id=?")
+        .run(action, id);
+      if (job.status !== "running") this.goalControlBoundary(id);
+      else this.dirty(threadId);
+      return true;
+    });
+  }
+  applyGoalControl(id: string): boolean {
+    return this.transaction(() => this.goalControlBoundary(id));
+  }
+  private goalControlBoundary(id: string): boolean {
+    const job = this.get(id),
+      workflow = this.workflow(id),
+      goal = this.goal(id);
+    if (!job || !workflow || !goal) throw new Error("Goal ownership lost");
+    if (
+      !["queued", "running"].includes(job.status) &&
+      !(workflow.state === "paused" && goal.control === "stop")
+    )
+      return job.status !== "running";
+    const exhausted = workflow.elapsed_ms >= workflow.budget_ms,
+      capped = workflow.step_count >= workflow.max_steps;
+    if (goal.control === "active" && !exhausted && !capped) return false;
+    const stopped = goal.control === "stop";
+    const reason = stopped
+      ? "owner_stopped_goal"
+      : goal.control === "pause"
+        ? "owner_paused_goal"
+        : exhausted
+          ? "workflow_budget_exhausted"
+          : "workflow_step_limit";
+    this.db
+      .prepare("UPDATE workflows SET state=? WHERE job_id=?")
+      .run(stopped ? "cancelled" : "paused", id);
+    this.db
+      .prepare(
+        "UPDATE jobs SET status=?,error_code=?,finished_at=?,notification='pending' WHERE id=?",
+      )
+      .run(stopped ? "cancelled" : "interrupted", reason, Date.now(), id);
+    this.dirty(job.thread_id);
+    return true;
+  }
+  resumeGoal(id: string, threadId: string): boolean {
+    return this.transaction(() => {
+      const job = this.get(id),
+        workflow = this.workflow(id),
+        goal = this.goal(id);
+      if (
+        !job ||
+        job.thread_id !== threadId ||
+        job.status !== "interrupted" ||
+        !goal ||
+        !workflow ||
+        workflow.state !== "paused" ||
+        workflow.elapsed_ms >= workflow.budget_ms ||
+        workflow.step_count >= workflow.max_steps ||
+        this.db
+          .prepare(
+            "SELECT 1 FROM conversations WHERE thread_id=? AND blocked_reason IS NOT NULL",
+          )
+          .get(threadId) ||
+        this.db
+          .prepare(
+            "SELECT 1 FROM jobs WHERE thread_id=? AND status IN('queued','running')",
+          )
+          .get(threadId)
+      )
+        return false;
+      this.db
+        .prepare("UPDATE workflows SET state='active' WHERE job_id=?")
+        .run(id);
+      this.db
+        .prepare("UPDATE goals SET control='active' WHERE job_id=?")
+        .run(id);
+      this.db
+        .prepare(
+          "UPDATE jobs SET status='queued',error_code=NULL,finished_at=NULL,queued_at=?,notification='pending' WHERE id=?",
+        )
+        .run(this.nextQueueTime(), id);
       this.dirty(threadId);
       return true;
     });
@@ -628,7 +960,14 @@ export class Store {
     outcome: WorkOutcome,
     elapsedMs: number,
   ): { continued: boolean; status: JobStatus; reason: string | null } {
+    this.validateCheckpoint(outcome);
     const spent = this.spent(elapsedMs);
+    return this.transaction(() => {
+      if (this.goal(id)) throw new Error("Supervised goal requires a review");
+      return this.acceptCheckpoint(id, outcome, spent);
+    });
+  }
+  private validateCheckpoint(outcome: WorkOutcome): void {
     if (
       !outcome ||
       Object.keys(outcome).sort().join(",") !== "nextAction,outcome,summary" ||
@@ -641,81 +980,85 @@ export class Store {
       (outcome.outcome === "continue" && !outcome.nextAction.trim())
     )
       throw new Error("Invalid workflow checkpoint");
-    return this.transaction(() => {
-      const job = this.get(id),
-        workflow = this.workflow(id);
-      if (
-        !job ||
-        job.status !== "running" ||
-        !workflow ||
-        workflow.state !== "active"
+  }
+  private acceptCheckpoint(
+    id: string,
+    outcome: WorkOutcome,
+    spent: number,
+  ): { continued: boolean; status: JobStatus; reason: string | null } {
+    const job = this.get(id),
+      workflow = this.workflow(id);
+    if (
+      !job ||
+      job.status !== "running" ||
+      !workflow ||
+      workflow.state !== "active"
+    )
+      throw new Error("Workflow ownership lost");
+    const elapsed = this.totalSpent(workflow.elapsed_ms, spent),
+      step = workflow.step_count + 1;
+    if (step > workflow.max_steps)
+      throw new Error("Workflow step limit exceeded");
+    let state: Workflow["state"],
+      status: JobStatus,
+      reason: string | null = null;
+    if (outcome.outcome === "completed") {
+      state = "completed";
+      status = "succeeded";
+    } else if (outcome.outcome === "blocked") {
+      state = "blocked";
+      status = "interrupted";
+      reason = "workflow_blocked";
+    } else if (elapsed >= workflow.budget_ms) {
+      state = "paused";
+      status = "interrupted";
+      reason = "workflow_budget_exhausted";
+    } else if (step >= workflow.max_steps) {
+      state = "paused";
+      status = "interrupted";
+      reason = "workflow_step_limit";
+    } else {
+      state = "active";
+      status = "queued";
+    }
+    this.db
+      .prepare(
+        "INSERT INTO workflow_steps(job_id,step,outcome,summary,next_action,elapsed_ms,created_at) VALUES(?,?,?,?,?,?,?)",
       )
-        throw new Error("Workflow ownership lost");
-      const elapsed = this.totalSpent(workflow.elapsed_ms, spent),
-        step = workflow.step_count + 1;
-      if (step > workflow.max_steps)
-        throw new Error("Workflow step limit exceeded");
-      let state: Workflow["state"],
-        status: JobStatus,
-        reason: string | null = null;
-      if (outcome.outcome === "completed") {
-        state = "completed";
-        status = "succeeded";
-      } else if (outcome.outcome === "blocked") {
-        state = "blocked";
-        status = "interrupted";
-        reason = "workflow_blocked";
-      } else if (elapsed >= workflow.budget_ms) {
-        state = "paused";
-        status = "interrupted";
-        reason = "workflow_budget_exhausted";
-      } else if (step >= workflow.max_steps) {
-        state = "paused";
-        status = "interrupted";
-        reason = "workflow_step_limit";
-      } else {
-        state = "active";
-        status = "queued";
-      }
+      .run(
+        id,
+        step,
+        outcome.outcome,
+        outcome.summary,
+        outcome.nextAction,
+        spent,
+        Date.now(),
+      );
+    this.db
+      .prepare(
+        "UPDATE workflows SET elapsed_ms=?,step_count=?,last_summary=?,next_action=?,state=? WHERE job_id=?",
+      )
+      .run(elapsed, step, outcome.summary, outcome.nextAction, state, id);
+    this.db
+      .prepare(
+        "UPDATE jobs SET status=?,result=?,error_code=?,finished_at=?,queued_at=?,notification='pending' WHERE id=?",
+      )
+      .run(
+        status,
+        outcome.summary,
+        reason,
+        status === "queued" ? null : Date.now(),
+        status === "queued" ? this.nextQueueTime() : job.queued_at,
+        id,
+      );
+    if (state === "blocked")
       this.db
         .prepare(
-          "INSERT INTO workflow_steps(job_id,step,outcome,summary,next_action,elapsed_ms,created_at) VALUES(?,?,?,?,?,?,?)",
+          "UPDATE conversations SET blocked_reason='workflow_blocked' WHERE thread_id=?",
         )
-        .run(
-          id,
-          step,
-          outcome.outcome,
-          outcome.summary,
-          outcome.nextAction,
-          spent,
-          Date.now(),
-        );
-      this.db
-        .prepare(
-          "UPDATE workflows SET elapsed_ms=?,step_count=?,last_summary=?,next_action=?,state=? WHERE job_id=?",
-        )
-        .run(elapsed, step, outcome.summary, outcome.nextAction, state, id);
-      this.db
-        .prepare(
-          "UPDATE jobs SET status=?,result=?,error_code=?,finished_at=?,queued_at=?,notification='pending' WHERE id=?",
-        )
-        .run(
-          status,
-          outcome.summary,
-          reason,
-          status === "queued" ? null : Date.now(),
-          status === "queued" ? this.nextQueueTime() : job.queued_at,
-          id,
-        );
-      if (state === "blocked")
-        this.db
-          .prepare(
-            "UPDATE conversations SET blocked_reason='workflow_blocked' WHERE thread_id=?",
-          )
-          .run(job.thread_id);
-      this.dirty(job.thread_id);
-      return { continued: status === "queued", status, reason };
-    });
+        .run(job.thread_id);
+    this.dirty(job.thread_id);
+    return { continued: status === "queued", status, reason };
   }
   private spent(elapsedMs: number): number {
     if (!Number.isSafeInteger(elapsedMs) || elapsedMs < 0)
@@ -832,20 +1175,17 @@ export class Store {
           .get(id, threadId, threadId)
       )
         throw new Error("This job has already been successfully recovered");
-      const originalWorkflow = this.workflow(id);
       // Recovering an ancestor follows the latest accepted recovery, including an
       // explicitly fresh budget. Wall-clock timestamps and elapsed totals cannot
       // order distinct budgets or refund execution charged to a later recovery.
-      const workflow = originalWorkflow
-        ? (this.db
-            .prepare(
-              `WITH RECURSIVE chain(id) AS (
+      const workflow = this.db
+        .prepare(
+          `WITH RECURSIVE chain(id) AS (
         SELECT ? UNION SELECT j.id FROM jobs j JOIN chain c ON j.recovery_of=c.id WHERE j.thread_id=?
       ) SELECT w.* FROM workflows w JOIN chain c ON c.id=w.job_id
         JOIN job_acceptance accepted ON accepted.job_id=w.job_id ORDER BY accepted.sequence DESC LIMIT 1`,
-            )
-            .get(id, threadId) as unknown as Workflow)
-        : undefined;
+        )
+        .get(id, threadId) as Workflow | undefined;
       if (
         !options.work &&
         workflow &&
@@ -856,6 +1196,12 @@ export class Store {
         throw new Error(
           "Workflow budget is exhausted or paused; start a new explicit !work budget",
         );
+      const priorGoal = workflow ? this.goal(workflow.job_id) : undefined;
+      const supervised = options.work
+        ? options.work.supervised === true
+        : Boolean(priorGoal);
+      if (supervised && old.provider !== "codex")
+        throw new Error("Supervised goals require a Codex-bound thread");
       this.cancelQueued(threadId, "superseded_by_recovery");
       this.insertQueuedJob(
         newId,
@@ -893,6 +1239,26 @@ export class Store {
             )
             .run(newId, workflow.job_id);
       }
+      if (supervised) {
+        const sameGoal = !options.work || options.work.goal === workflow?.goal;
+        this.db
+          .prepare(
+            "INSERT INTO goals(job_id,pending_output,stalled_count,last_review,last_candidate) VALUES(?,?,?,?,?)",
+          )
+          .run(
+            newId,
+            sameGoal ? (priorGoal?.pending_output ?? null) : null,
+            !options.work ? (priorGoal?.stalled_count ?? 0) : 0,
+            priorGoal?.last_review ?? null,
+            sameGoal ? (priorGoal?.last_candidate ?? null) : null,
+          );
+        if (priorGoal && !options.work)
+          this.db
+            .prepare(
+              "INSERT INTO goal_reviews SELECT ?,step,candidate,review,progress,elapsed_ms,created_at FROM goal_reviews WHERE job_id=?",
+            )
+            .run(newId, priorGoal.job_id);
+      }
       this.db
         .prepare(
           "UPDATE conversations SET blocked_reason=NULL WHERE thread_id=?",
@@ -903,6 +1269,11 @@ export class Store {
     });
   }
   private cancelQueued(threadId: string, reason: string): void {
+    this.db
+      .prepare(
+        "UPDATE goals SET control='stop' WHERE job_id IN(SELECT id FROM jobs WHERE thread_id=? AND status='queued')",
+      )
+      .run(threadId);
     this.db
       .prepare(
         "UPDATE workflows SET state='cancelled' WHERE job_id IN(SELECT id FROM jobs WHERE thread_id=? AND status='queued')",
@@ -923,6 +1294,22 @@ export class Store {
       )
         throw new Error("A turn is still running");
       this.cancelQueued(threadId, "owner_started_new_session");
+      this.db
+        .prepare(
+          `UPDATE jobs SET status='cancelled',error_code='owner_started_new_session',finished_at=?
+        WHERE thread_id=? AND status='interrupted' AND id IN(SELECT g.job_id FROM goals g JOIN workflows w ON w.job_id=g.job_id WHERE w.state='paused')`,
+        )
+        .run(Date.now(), threadId);
+      this.db
+        .prepare(
+          "UPDATE goals SET control='stop' WHERE job_id IN(SELECT job_id FROM workflows WHERE state='paused' AND job_id IN(SELECT id FROM jobs WHERE thread_id=? AND error_code='owner_started_new_session'))",
+        )
+        .run(threadId);
+      this.db
+        .prepare(
+          "UPDATE workflows SET state='cancelled' WHERE state='paused' AND job_id IN(SELECT id FROM jobs WHERE thread_id=? AND error_code='owner_started_new_session')",
+        )
+        .run(threadId);
       if (
         Number(
           this.db
@@ -947,6 +1334,9 @@ export class Store {
         ) === 1;
       if (changed) {
         this.db
+          .prepare("UPDATE goals SET control='stop' WHERE job_id=?")
+          .run(id);
+        this.db
           .prepare("UPDATE workflows SET state='cancelled' WHERE job_id=?")
           .run(id);
         this.dirty(threadId);
@@ -965,7 +1355,7 @@ export class Store {
   pendingNotification(): Job | undefined {
     return this.db
       .prepare(
-        "SELECT * FROM jobs WHERE status IN('succeeded','failed','interrupted') AND notification='pending' ORDER BY finished_at,id LIMIT 1",
+        "SELECT * FROM jobs WHERE (status IN('succeeded','failed','interrupted') OR (status='cancelled' AND id IN(SELECT job_id FROM goals))) AND notification='pending' ORDER BY finished_at,id LIMIT 1",
       )
       .get() as Job | undefined;
   }
